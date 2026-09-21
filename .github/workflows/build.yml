@@ -1,0 +1,146 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "llama.cpp ref to build (branch, tag or commit)"
+        required: false
+        default: master
+      toolchain_version:
+        description: "snapdragon-toolchain image tag"
+        required: false
+        default: v0.7
+  push:
+    branches: [main]
+  schedule:
+    # weekly refresh against llama.cpp master
+    - cron: "17 3 * * 0"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  android-arm64-hexagon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      IMAGE: ghcr.io/snapdragon-toolchain/arm64-android:${{ inputs.toolchain_version || 'v0.7' }}
+      LLAMA_REF: ${{ inputs.llama_ref || 'master' }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          docker image prune -af || true
+          df -h /
+
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_REF }}
+          path: llama.cpp
+          fetch-depth: 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull toolchain
+        run: docker pull --platform linux/amd64 "$IMAGE"
+
+      - name: Configure and build
+        working-directory: llama.cpp
+        run: |
+          set -euo pipefail
+          cp docs/backend/snapdragon/CMakeUserPresets.json .
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -v "$PWD:/workspace" -w /workspace --platform linux/amd64 \
+            "$IMAGE" bash -c '
+              set -euo pipefail
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon
+              cmake --build build-snapdragon -j"$(nproc)"
+              cmake --install build-snapdragon --prefix /workspace/pkg/llama-hexagon
+            '
+
+      - name: Post-process package
+        working-directory: llama.cpp
+        run: |
+          set -euo pipefail
+          # ship the NDK libc++ and strip host-side binaries (skip Hexagon DSP skels)
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -v "$PWD:/workspace" -w /workspace --platform linux/amd64 \
+            "$IMAGE" bash -c '
+              set -euo pipefail
+              CPP=$(find "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt" \
+                    -path "*aarch64-linux-android/libc++_shared.so" | head -1)
+              STRIP=$(find "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt" -name llvm-strip | head -1)
+              cp "$CPP" /workspace/pkg/llama-hexagon/lib/
+              for f in /workspace/pkg/llama-hexagon/bin/* /workspace/pkg/llama-hexagon/lib/*.so; do
+                case "$f" in *libggml-htp-*) continue ;; esac
+                "$STRIP" --strip-unneeded "$f" 2>/dev/null || true
+              done
+            '
+          # drop test binaries / static libs to keep the artifact small
+          rm -f pkg/llama-hexagon/bin/test-* pkg/llama-hexagon/lib/*.a
+          # make the tarball self-contained
+          cp ../scripts/setup-termux.sh ../scripts/run-termux.sh pkg/llama-hexagon/
+          cp ../README.md pkg/llama-hexagon/README.md
+          chmod +x pkg/llama-hexagon/*.sh
+          du -sh pkg/llama-hexagon
+          ls pkg/llama-hexagon/bin
+
+      - name: Package
+        id: pkg
+        working-directory: llama.cpp
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          tar -cJf ../llama.cpp-snapdragon-android.tar.xz -C pkg llama-hexagon
+          cd ..
+          sha256sum llama.cpp-snapdragon-android.tar.xz > sha256sums.txt
+          ls -lh llama.cpp-snapdragon-android.tar.xz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-snapdragon-android
+          path: |
+            llama.cpp-snapdragon-android.tar.xz
+            sha256sums.txt
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest \
+              --title "Latest Snapdragon/Hexagon Android build" \
+              --notes "rolling release" --latest
+          gh release upload latest \
+            llama.cpp-snapdragon-android.tar.xz sha256sums.txt --clobber
+          gh release edit latest --latest --notes "$(cat <<EOF
+          Rolling Snapdragon/Hexagon Android (arm64) build for Termux.
+
+          - llama.cpp: ggml-org/llama.cpp @ ${{ steps.pkg.outputs.commit }}
+          - toolchain: ${{ env.IMAGE }}
+          - workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )"
