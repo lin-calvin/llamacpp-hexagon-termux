@@ -17,7 +17,7 @@ Grab `llama.cpp-snapdragon-android.tar.xz` from the rolling
 ```bash
 # in Termux
 pkg install -y wget tar xz-utils
-wget https://github.com/calvinweb/llamacpp-hexagon-termux/releases/download/latest/llama.cpp-snapdragon-android.tar.xz
+wget https://github.com/lin-calvin/llamacpp-hexagon-termux/releases/download/latest/llama.cpp-snapdragon-android.tar.xz
 tar -xJf llama.cpp-snapdragon-android.tar.xz
 cd llama-hexagon
 ./setup-termux.sh
